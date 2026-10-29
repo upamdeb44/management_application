@@ -1,4 +1,6 @@
 import json
+import os
+import time as _time_module
 import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_calendar import calendar
@@ -19,6 +21,23 @@ from logic import (
 )
 
 st.set_page_config(page_title="MyPlanner", page_icon="📅", layout="wide")
+
+
+def _setting(name, default):
+    """Read a setting from an environment variable or from Streamlit secrets."""
+    if os.environ.get(name):
+        return os.environ[name]
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+# Cloud servers run on UTC. Reminders compare against the clock, so run the app on YOUR timezone.
+if hasattr(_time_module, "tzset"):      # Linux (the cloud); on Windows your PC's own timezone is used
+    os.environ["TZ"] = _setting("APP_TIMEZONE", "Asia/Kolkata")
+    _time_module.tzset()
+
 create_table()
 
 # =========================================================
@@ -186,7 +205,8 @@ def delete_category_cb(name):
     st.session_state.flash = f"Category '{name}' removed. Existing tasks keep it."
 
 
-def reminder_picker(key, defaults=(False, False, False, False)):
+def reminder_picker(key, defaults=(False, False, False, False), at_time=True, custom_minutes=0):
+    """Returns (3 days, 2 days, 1 day, 1 hour, at the due time, custom minutes before)."""
     c1, c2 = st.columns(2)
     with c1:
         r3 = st.checkbox("3 days before", value=bool(defaults[0]), key=f"{key}_r3")
@@ -194,7 +214,10 @@ def reminder_picker(key, defaults=(False, False, False, False)):
     with c2:
         r1 = st.checkbox("1 day before", value=bool(defaults[2]), key=f"{key}_r1")
         rh = st.checkbox("1 hour before", value=bool(defaults[3]), key=f"{key}_rh")
-    return r3, r2, r1, rh
+    r0 = st.checkbox("At the due time", value=bool(at_time), key=f"{key}_r0")
+    rc = st.number_input("Extra reminder: minutes before (0 = off)", min_value=0, max_value=10080,
+                         value=int(custom_minutes or 0), step=5, key=f"{key}_rc")
+    return r3, r2, r1, rh, r0, int(rc)
 
 
 def html_embed(html, height=0):
@@ -212,7 +235,8 @@ def cookie_component(token=None):
     else:
         value = f"{COOKIE_NAME}=; max-age=0; path=/; SameSite=Lax"
     html_embed(
-        "<script>try{window.parent.document.cookie='" + value + "';}catch(e){}</script>",
+        "<script>try{window.parent.document.cookie='" + value + "'"
+        "+(window.parent.location.protocol==='https:'?'; Secure':'');}catch(e){}</script>",
         height=0,
     )
 
@@ -262,14 +286,26 @@ def desktop_permission_widget():
     """, height=48)
 
 
-@st.fragment(run_every=30)
+def send_test_notification():
+    st.session_state["_test_alert"] = True
+
+
+@st.fragment(run_every=20)
 def notification_center():
-    """Checks for due reminders every 30 s (and on every page load), alerts, and lists the inbox."""
+    """Checks for due reminders every 20 s (and on every page load), alerts, and lists the inbox."""
     user_id = st.session_state.user_id
+    new_alerts = []
     try:
         new_alerts = fire_due_reminders(user_id)
-    except Exception:
-        new_alerts = []
+    except Exception as e:   # show the problem instead of failing silently
+        st.error(f"Couldn't check reminders: {e}")
+
+    if st.session_state.pop("_test_alert", False):
+        new_alerts.append({
+            "title": "Test notification",
+            "message": "If you can see this, notifications work 🎉",
+            "tag": f"test_{datetime.now().timestamp()}",
+        })
 
     for a in new_alerts:
         st.toast(f"**{a['title']}** — {a['message']}", icon="🔔")
@@ -292,7 +328,11 @@ def notification_center():
         if notes:
             st.button("Dismiss all", key="dismiss_all", use_container_width=True,
                       on_click=dismiss_all_notifications, args=(user_id,))
+        st.button("Send a test notification", key="test_notif", use_container_width=True,
+                  on_click=send_test_notification)
         desktop_permission_widget()
+        st.caption(f"Last checked {datetime.now().strftime('%I:%M:%S %p')} · re-checks every 20 s "
+                   "while this tab is open")
 
 
 # =========================================================
@@ -409,7 +449,7 @@ with st.sidebar:
     todo_recurrence, todo_interval, todo_end_iso = recurrence_picker(f"todo_rec_{sv}", todo_due_date)
 
     st.markdown("**🔔 Reminders**")
-    t3, t2, t1, th = reminder_picker(f"todo_rem_{sv}")
+    t3, t2, t1, th, t0, tc = reminder_picker(f"todo_rem_{sv}")
 
     if st.button("➕ Add Task", type="primary", use_container_width=True):
         if todo_cat_new and not todo_cat:
@@ -423,7 +463,8 @@ with st.sidebar:
                 due_time=final_time_sidebar, reminder_3_days=t3, reminder_2_days=t2,
                 reminder_1_day=t1, reminder_1_hour=th, recurrence_type=todo_recurrence,
                 recurrence_interval=todo_interval, recurrence_days="",
-                recurrence_end_date=todo_end_iso
+                recurrence_end_date=todo_end_iso,
+                reminder_at_time=t0, reminder_custom_minutes=tc
             )
             st.session_state.flash = "Task added!"
             st.session_state.sidebar_version += 1   # clears the sidebar inputs
@@ -443,7 +484,7 @@ with st.sidebar:
                 st.write(cat_name)
             with c2:
                 st.button("✕", key=f"delcat_{cat_name}", help="Remove category",
-                        on_click=delete_category_cb, args=(cat_name,))
+                          on_click=delete_category_cb, args=(cat_name,))
         st.text_input("New category", key="mgr_new_cat", max_chars=30, placeholder="e.g. Fitness")
         st.button("Add category", key="mgr_add_cat", use_container_width=True, on_click=add_category_cb)
 
@@ -509,10 +550,13 @@ def edit_task_dialog(task_id):
         st.info("This is a repeating task: changes apply to every occurrence in the series.")
 
     st.markdown("**🔔 Reminders**")
-    r3, r2, r1, rh = reminder_picker(k, (
-        work["reminder_3_days"], work["reminder_2_days"],
-        work["reminder_1_day"], work["reminder_1_hour"],
-    ))
+    r3, r2, r1, rh, r0, rc = reminder_picker(
+        k,
+        (work["reminder_3_days"], work["reminder_2_days"],
+         work["reminder_1_day"], work["reminder_1_hour"]),
+        at_time=work["reminder_at_time"],
+        custom_minutes=work["reminder_custom_minutes"],
+    )
 
     is_recurring = (work["recurrence_type"] or "Does not repeat") != "Does not repeat"
     colA, colB = st.columns(2)
@@ -530,6 +574,7 @@ def edit_task_dialog(task_id):
                     reminder_1_day=r1, reminder_1_hour=rh, recurrence_type=rec_type,
                     recurrence_interval=rec_interval, recurrence_days=work["recurrence_days"] or "",
                     recurrence_end_date=rec_end_iso,
+                    reminder_at_time=r0, reminder_custom_minutes=rc,
                 )
                 st.session_state.flash = "Task updated!"
                 st.session_state.cal_version += 1
@@ -537,7 +582,7 @@ def edit_task_dialog(task_id):
                 st.rerun()
     with colB:
         if st.button("Delete Series" if is_recurring else "Delete Task",
-                    use_container_width=True, key=f"{k}_delete"):
+                     use_container_width=True, key=f"{k}_delete"):
             delete_work(task_id, user_id)
             st.session_state.flash = "Task deleted."
             st.session_state.cal_version += 1
@@ -568,7 +613,7 @@ def add_task_dialog(date_str, time_str):
     rec_type, rec_interval, rec_end_iso = recurrence_picker(k, due_date)
 
     st.markdown("**🔔 Reminders**")
-    r3, r2, r1, rh = reminder_picker(k)
+    r3, r2, r1, rh, r0, rc = reminder_picker(k)
 
     if st.button("➕ Add Task", type="primary", use_container_width=True, key=f"{k}_submit"):
         if not title.strip():
@@ -583,6 +628,7 @@ def add_task_dialog(date_str, time_str):
                 reminder_1_day=r1, reminder_1_hour=rh, recurrence_type=rec_type,
                 recurrence_interval=rec_interval, recurrence_days="",
                 recurrence_end_date=rec_end_iso,
+                reminder_at_time=r0, reminder_custom_minutes=rc,
             )
             st.session_state.flash = "Task added!"
             st.session_state.form_version += 1
@@ -695,7 +741,7 @@ if st.session_state.page == "Calendar":
             (task_id, title, description, due_date, due_time, category, priority,
              reminder_3_days, reminder_2_days, reminder_1_day, reminder_1_hour,
              completed, recurrence_type, recurrence_interval, recurrence_days,
-             recurrence_end_date) = work
+             recurrence_end_date) = work[:16]
 
             due_time_display = format_due_time(due_time)
 
@@ -731,14 +777,14 @@ if st.session_state.page == "Calendar":
                 with head1:
                     st.markdown(f"### 🔁 {title}")
                     st.caption(f"{recurrence_type} · until {recurrence_end_date or 'no end date'}"
-                            + (f" · {category}" if category else ""))
+                               + (f" · {category}" if category else ""))
                 with head2:
                     if st.button("✏️ Edit series", key=f"list_edit_series_{task_id}",
-                                help="Edit this task and all of its repeats"):
+                                 help="Edit this task and all of its repeats"):
                         edit_task_dialog(task_id)
                 with head3:
                     if st.button("🗑️ Delete series", key=f"delete_series_{task_id}",
-                                help="Deletes this task and ALL of its repeats"):
+                                 help="Deletes this task and ALL of its repeats"):
                         delete_work(task_id, st.session_state.user_id)
                         st.session_state.cal_version += 1
                         st.session_state.last_cal_state = None
@@ -776,7 +822,7 @@ if st.session_state.page == "Calendar":
                                 st.rerun()
                         with col3:
                             if st.button("✏️", key=f"list_edit_{occurrence_key}",
-                                        help="Edit this task (the whole series)"):
+                                         help="Edit this task (the whole series)"):
                                 edit_task_dialog(task_id)
 
 # =========================================================

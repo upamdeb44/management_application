@@ -1,0 +1,11 @@
+# local database
+planner.db
+
+# secrets
+.streamlit/secrets.toml
+
+# Python junk
+__pycache__/
+*.pyc
+.venv/
+venv/

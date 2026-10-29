@@ -1,25 +1,163 @@
+"""
+Database layer.
+
+* Locally (no DATABASE_URL set)  -> a SQLite file (planner.db), exactly like before.
+* Deployed (DATABASE_URL set)    -> PostgreSQL (e.g. a free Neon database). The URL can come from the
+  DATABASE_URL environment variable or from Streamlit secrets.
+The rest of the code doesn't care which one is used.
+"""
+import os
 import sqlite3
 import hashlib
 import secrets
+import time as time_module
 from datetime import datetime, time, timedelta
 
-DATABASE_NAME = "planner.db"
+DATABASE_NAME = os.environ.get("SQLITE_PATH", "planner.db")
 SESSION_DAYS = 30
 
 
+def _find_database_url():
+    url = os.environ.get("DATABASE_URL")
+    if url:
+        return url
+    try:                                    # Streamlit Community Cloud keeps it in "Secrets"
+        import streamlit as st
+        return st.secrets.get("DATABASE_URL") or None
+    except Exception:
+        return None
+
+
+DATABASE_URL = _find_database_url()
+IS_POSTGRES = bool(DATABASE_URL)
+
+if IS_POSTGRES:
+    import psycopg2
+    import psycopg2.pool
+    INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg2.IntegrityError)
+    PK = "SERIAL PRIMARY KEY"
+else:
+    INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
+    PK = "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+# ---------- PostgreSQL: pooled connections behind the same API the SQLite code uses ----------
+_pool = None
+_last_used = {}
+
+
+def _get_pool():
+    global _pool
+    if _pool is None:
+        _pool = psycopg2.pool.ThreadedConnectionPool(
+            1, 10, dsn=DATABASE_URL, connect_timeout=10,
+            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5,
+        )
+    return _pool
+
+
+class _PgCursor:
+    """Lets the existing SQL (written with ? placeholders) run on PostgreSQL."""
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, sql, params=None):
+        self._cursor.execute(sql.replace("?", "%s"), params if params else None)
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    @property
+    def description(self):
+        return self._cursor.description
+
+
+class _PgConnection:
+    def __init__(self, conn):
+        self._conn = conn
+        self._closed = False
+
+    def cursor(self):
+        return _PgCursor(self._conn.cursor())
+
+    def execute(self, sql, params=None):
+        return self.cursor().execute(sql, params)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._conn.rollback()          # discards anything uncommitted (e.g. after an error)
+        except Exception:
+            pass
+        _last_used[id(self._conn)] = time_module.time()
+        try:
+            _get_pool().putconn(self._conn)
+        except Exception:
+            pass
+
+
+def _checkout_postgres():
+    pool = _get_pool()
+    for _ in range(6):
+        try:
+            conn = pool.getconn()
+        except psycopg2.pool.PoolError:    # all connections busy: wait a moment
+            time_module.sleep(0.2)
+            continue
+        try:
+            if conn.closed:
+                raise psycopg2.OperationalError("connection closed")
+            if time_module.time() - _last_used.get(id(conn), 0) > 30:   # idle a while: make sure it's alive
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                conn.rollback()
+            return _PgConnection(conn)
+        except Exception:
+            try:
+                pool.putconn(conn, close=True)
+            except Exception:
+                pass
+    raise RuntimeError("Could not connect to the database. Check DATABASE_URL.")
+
+
 def get_connection():
+    if IS_POSTGRES:
+        return _checkout_postgres()
     connection = sqlite3.connect(DATABASE_NAME)
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
 
 
+_schema_ready = False
+
+
 def create_table():
+    global _schema_ready
+    if _schema_ready:      # only needs to run once per server process
+        return
     connection = get_connection()
     cursor = connection.cursor()
 
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {PK},
             name TEXT NOT NULL,
             email TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
@@ -27,9 +165,9 @@ def create_table():
         )
     """)
 
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {PK},
             user_id INTEGER,
             title TEXT NOT NULL,
             description TEXT,
@@ -46,6 +184,8 @@ def create_table():
             recurrence_days TEXT DEFAULT '',
             recurrence_end_date TEXT,
             completed INTEGER DEFAULT 0,
+            reminder_at_time INTEGER DEFAULT 1,
+            reminder_custom_minutes INTEGER DEFAULT 0,
             FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         )
     """)
@@ -62,16 +202,19 @@ def create_table():
         ("recurrence_end_date", "TEXT"),
         ("completed", "INTEGER DEFAULT 0"),
         ("user_id", "INTEGER"),
+        ("reminder_at_time", "INTEGER DEFAULT 1"),      # existing tasks also notify at their due time
+        ("reminder_custom_minutes", "INTEGER DEFAULT 0"),
     ]
-    for column_name, column_type in columns:
-        try:
-            cursor.execute(f"ALTER TABLE tasks ADD COLUMN {column_name} {column_type}")
-        except sqlite3.OperationalError:
-            pass
+    if not IS_POSTGRES:    # a fresh PostgreSQL database already has every column
+        for column_name, column_type in columns:
+            try:
+                cursor.execute(f"ALTER TABLE tasks ADD COLUMN {column_name} {column_type}")
+            except sqlite3.OperationalError:
+                pass
 
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS task_occurrence_status (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {PK},
             task_id INTEGER NOT NULL,
             occurrence_date TEXT NOT NULL,
             completed INTEGER DEFAULT 0,
@@ -81,18 +224,21 @@ def create_table():
     """)
 
     # User-defined task categories (the built-in ones live in the app)
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {PK},
             user_id INTEGER NOT NULL,
-            name TEXT NOT NULL COLLATE NOCASE,
-            UNIQUE(user_id, name),
+            name TEXT NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         )
     """)
+    # category names are unique per user, ignoring upper/lower case
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_categories_user_name ON categories (user_id, lower(name))"
+    )
 
     # Login sessions (the browser keeps the random token in a cookie; only its hash is stored)
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS sessions (
             token_hash TEXT PRIMARY KEY,
             user_id INTEGER NOT NULL,
@@ -102,9 +248,9 @@ def create_table():
     """)
 
     # Reminders that have already fired (prevents duplicates) + the notification inbox
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS reminder_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {PK},
             user_id INTEGER NOT NULL,
             task_id INTEGER NOT NULL,
             occurrence_date TEXT NOT NULL,
@@ -119,6 +265,7 @@ def create_table():
     """)
     connection.commit()
     connection.close()
+    _schema_ready = True
 
 
 # ---------------------------------------------------------
@@ -147,12 +294,18 @@ def create_user(name, email, password):
     connection = get_connection()
     cursor = connection.cursor()
     try:
-        cursor.execute("""
+        insert_sql = """
             INSERT INTO users (name, email, password_hash, created_at)
             VALUES (?, ?, ?, ?)
-        """, (name.strip(), email.strip().lower(), hash_password(password),
-              datetime.now().isoformat()))
-        user_id = cursor.lastrowid
+        """
+        params = (name.strip(), email.strip().lower(), hash_password(password),
+                  datetime.now().isoformat())
+        if IS_POSTGRES:
+            cursor.execute(insert_sql + " RETURNING id", params)
+            user_id = cursor.fetchone()[0]
+        else:
+            cursor.execute(insert_sql, params)
+            user_id = cursor.lastrowid
 
         # Legacy tasks without an owner are claimed ONLY by the very first user.
         cursor.execute("SELECT COUNT(*) FROM users")
@@ -161,7 +314,7 @@ def create_user(name, email, password):
 
         connection.commit()
         return True, user_id, ""
-    except sqlite3.IntegrityError:
+    except INTEGRITY_ERRORS:
         return False, None, "An account with this email already exists."
     finally:
         connection.close()
@@ -196,7 +349,7 @@ def get_categories(user_id):
     connection = get_connection()
     cursor = connection.cursor()
     cursor.execute(
-        "SELECT name FROM categories WHERE user_id = ? ORDER BY name COLLATE NOCASE", (user_id,)
+        "SELECT name FROM categories WHERE user_id = ? ORDER BY lower(name)", (user_id,)
     )
     names = [row[0] for row in cursor.fetchall()]
     connection.close()
@@ -210,7 +363,9 @@ def add_category(user_id, name):
         return False
     connection = get_connection()
     cursor = connection.cursor()
-    cursor.execute("INSERT OR IGNORE INTO categories (user_id, name) VALUES (?, ?)", (user_id, name))
+    cursor.execute(
+        "INSERT INTO categories (user_id, name) VALUES (?, ?) ON CONFLICT DO NOTHING", (user_id, name)
+    )
     added = cursor.rowcount == 1
     connection.commit()
     connection.close()
@@ -219,7 +374,9 @@ def add_category(user_id, name):
 
 def delete_category(user_id, name):
     connection = get_connection()
-    connection.execute("DELETE FROM categories WHERE user_id = ? AND name = ?", (user_id, name))
+    connection.execute(
+        "DELETE FROM categories WHERE user_id = ? AND lower(name) = lower(?)", (user_id, name)
+    )
     connection.commit()
     connection.close()
 
@@ -280,9 +437,10 @@ def claim_reminder(user_id, task_id, occurrence_date, label, title, message, sil
     connection = get_connection()
     cursor = connection.cursor()
     cursor.execute("""
-        INSERT OR IGNORE INTO reminder_log
+        INSERT INTO reminder_log
             (user_id, task_id, occurrence_date, reminder_label, title, message, created_at, dismissed)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT DO NOTHING
     """, (user_id, task_id, occurrence_date, label, title, message,
           datetime.now().isoformat(), 1 if silent else 0))
     claimed = cursor.rowcount == 1
@@ -336,18 +494,21 @@ def _time_sort_key(due_time):
 def add_work(user_id, title, description, due_date, due_time, category, priority,
              reminder_3_days, reminder_2_days, reminder_1_day, reminder_1_hour,
              recurrence_type="Does not repeat", recurrence_interval=1,
-             recurrence_days="", recurrence_end_date=None):
+             recurrence_days="", recurrence_end_date=None,
+             reminder_at_time=False, reminder_custom_minutes=0):
     connection = get_connection()
     cursor = connection.cursor()
     cursor.execute("""
         INSERT INTO tasks (
             user_id, title, description, due_date, due_time, category, priority,
             reminder_3_days, reminder_2_days, reminder_1_day, reminder_1_hour,
-            recurrence_type, recurrence_interval, recurrence_days, recurrence_end_date
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            recurrence_type, recurrence_interval, recurrence_days, recurrence_end_date,
+            reminder_at_time, reminder_custom_minutes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (user_id, title, description, due_date, due_time, category, priority,
           int(reminder_3_days), int(reminder_2_days), int(reminder_1_day), int(reminder_1_hour),
-          recurrence_type, int(recurrence_interval), recurrence_days, recurrence_end_date))
+          recurrence_type, int(recurrence_interval), recurrence_days, recurrence_end_date,
+          int(reminder_at_time), int(reminder_custom_minutes or 0)))
     connection.commit()
     connection.close()
 
@@ -358,7 +519,8 @@ def get_all_works(user_id):
     cursor.execute("""
         SELECT id, title, description, due_date, due_time, category, priority,
                reminder_3_days, reminder_2_days, reminder_1_day, reminder_1_hour, completed,
-               recurrence_type, recurrence_interval, recurrence_days, recurrence_end_date
+               recurrence_type, recurrence_interval, recurrence_days, recurrence_end_date,
+               COALESCE(reminder_at_time, 0), COALESCE(reminder_custom_minutes, 0)
         FROM tasks WHERE user_id = ?
     """, (user_id,))
     works = cursor.fetchall()
@@ -431,7 +593,9 @@ def get_work_by_task_id(task_id, user_id):
     cursor.execute("""
         SELECT id, title, description, due_date, due_time, category, priority,
                reminder_3_days, reminder_2_days, reminder_1_day, reminder_1_hour,
-               recurrence_type, recurrence_interval, recurrence_days, recurrence_end_date
+               recurrence_type, recurrence_interval, recurrence_days, recurrence_end_date,
+               COALESCE(reminder_at_time, 0) AS reminder_at_time,
+               COALESCE(reminder_custom_minutes, 0) AS reminder_custom_minutes
         FROM tasks WHERE id = ? AND user_id = ?
     """, (task_id, user_id))
     row = cursor.fetchone()
@@ -446,7 +610,8 @@ def get_work_by_task_id(task_id, user_id):
 
 def update_work(task_id, user_id, title, description, due_date, due_time, category, priority,
                 reminder_3_days, reminder_2_days, reminder_1_day, reminder_1_hour,
-                recurrence_type, recurrence_interval, recurrence_days, recurrence_end_date):
+                recurrence_type, recurrence_interval, recurrence_days, recurrence_end_date,
+                reminder_at_time=False, reminder_custom_minutes=0):
     connection = get_connection()
     cursor = connection.cursor()
 
@@ -463,12 +628,14 @@ def update_work(task_id, user_id, title, description, due_date, due_time, catego
         UPDATE tasks SET
             title=?, description=?, due_date=?, due_time=?, category=?, priority=?,
             reminder_3_days=?, reminder_2_days=?, reminder_1_day=?, reminder_1_hour=?,
-            recurrence_type=?, recurrence_interval=?, recurrence_days=?, recurrence_end_date=?
+            recurrence_type=?, recurrence_interval=?, recurrence_days=?, recurrence_end_date=?,
+            reminder_at_time=?, reminder_custom_minutes=?
         WHERE id=? AND user_id=?
     """, (title, description, due_date, due_time, category, priority,
           int(reminder_3_days), int(reminder_2_days), int(reminder_1_day), int(reminder_1_hour),
           recurrence_type, int(recurrence_interval or 1), recurrence_days,
-          recurrence_end_date, task_id, user_id))
+          recurrence_end_date, int(reminder_at_time), int(reminder_custom_minutes or 0),
+          task_id, user_id))
 
     # Completion marks are keyed by date. If the schedule changed they no longer
     # line up with any occurrence, so clear them instead of leaving orphans.

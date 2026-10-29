@@ -55,7 +55,9 @@ def set_occurrence_status(task_id, user_id, occurrence_date, recurrence_type, co
 def generate_occurrences(work, user_id):
     (task_id, title, description, due_date, due_time, category, priority,
      reminder_3_days, reminder_2_days, reminder_1_day, reminder_1_hour, completed,
-     recurrence_type, recurrence_interval, recurrence_days, recurrence_end_date) = work
+     recurrence_type, recurrence_interval, recurrence_days, recurrence_end_date) = work[:16]
+    reminder_at_time = work[16] if len(work) > 16 else 0
+    reminder_custom_minutes = work[17] if len(work) > 17 else 0
 
     start_date = datetime.strptime(due_date[:10], "%Y-%m-%d").date()
     recurrence_type = recurrence_type or "Does not repeat"
@@ -94,6 +96,8 @@ def generate_occurrences(work, user_id):
             "recurrence_type": recurrence_type, "reminder_3_days": reminder_3_days,
             "reminder_2_days": reminder_2_days, "reminder_1_day": reminder_1_day,
             "reminder_1_hour": reminder_1_hour,
+            "reminder_at_time": reminder_at_time,
+            "reminder_custom_minutes": reminder_custom_minutes,
         })
 
     if recurrence_type == "Does not repeat":
@@ -161,10 +165,24 @@ def get_reminders_for_occurrence(occurrence):
         reminders.append((due_datetime - timedelta(days=1), "1 day before"))
     if occurrence["reminder_1_hour"]:
         reminders.append((due_datetime - timedelta(hours=1), "1 hour before"))
+    minutes = int(occurrence.get("reminder_custom_minutes") or 0)
+    if minutes > 0:
+        reminders.append((due_datetime - timedelta(minutes=minutes), f"{minutes} min before"))
+    if occurrence.get("reminder_at_time"):
+        reminders.append((due_datetime, "At due time"))
     return reminders
 
 
+# Still alert this long after the due time (e.g. the app was closed at the moment it was due)
+DUE_GRACE = timedelta(hours=1)
+
+
 def describe_time_left(due, now):
+    at = due.strftime('%d %b, %I:%M %p')
+    if due <= now:
+        minutes = int((now - due).total_seconds() // 60)
+        when = "due now" if minutes < 1 else f"was due {minutes} min ago"
+        return f"{when} (at {at})"
     minutes = max(int((due - now).total_seconds() // 60), 1)
     if minutes < 60:
         rel = f"in {minutes} min"
@@ -174,13 +192,13 @@ def describe_time_left(due, now):
     else:
         days = minutes // (24 * 60)
         rel = f"in {days} day" + ("s" if days != 1 else "")
-    return f"due {rel} (at {due.strftime('%d %b, %I:%M %p')})"
+    return f"due {rel} (at {at})"
 
 
 def fire_due_reminders(user_id):
     """
-    Find reminders whose time has arrived (and whose task isn't due yet / done),
-    record them so they never fire twice, and return the NEW ones as alert dicts.
+    Find reminders whose time has arrived (and whose task isn't done), record them so they
+    never fire twice, and return the NEW ones as alert dicts.
     If several reminders for one task are due at once, only the latest one alerts.
     """
     now = datetime.now()
@@ -191,10 +209,10 @@ def fire_due_reminders(user_id):
         if occ["completed"]:
             continue
         # the longest reminder is 3 days, so only nearby occurrences can be due
-        if occ["date"] < today or occ["date"] > today + timedelta(days=4):
+        if occ["date"] < today - timedelta(days=1) or occ["date"] > today + timedelta(days=4):
             continue
         due = parse_due_datetime(occ["date"].isoformat(), occ["due_time"])
-        if not due or due <= now:   # once due, the task shows under "Overdue" instead
+        if not due or now > due + DUE_GRACE:   # long past due: shows under "Overdue" instead
             continue
 
         due_reminders = sorted(r for r in get_reminders_for_occurrence(occ) if r[0] <= now)
